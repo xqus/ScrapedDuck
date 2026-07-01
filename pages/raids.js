@@ -3,6 +3,152 @@ const jsd = require('jsdom');
 const { JSDOM } = jsd;
 const https = require('https');
 
+const EVENTS_FEED_URL = "https://leekduck.com/feeds/events.json";
+
+function fetchJson(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let body = "";
+            res.on('data', chunk => body += chunk);
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(body));
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        }).on('error', reject);
+    });
+}
+
+// Raid rotations reset at a fixed local time in each region (Niantic resets
+// happen at e.g. 6:00 AM in every timezone individually, not at one shared
+// UTC instant), so the events feed gives start/end without a timezone
+// suffix. Treat that value as a wall-clock reading and widen it by the full
+// spread of real-world UTC offsets (-12 to +14) to get the window during
+// which the event is current somewhere on Earth.
+function parseAsUtc(str) {
+    if (!str) return null;
+    return new Date(str.endsWith('Z') ? str : str + 'Z');
+}
+
+function isOngoingSomewhereInWorld(startStr, endStr, now) {
+    const start = parseAsUtc(startStr);
+    const end = parseAsUtc(endStr);
+    if (!start || !end || isNaN(start) || isNaN(end)) return false;
+    const HOUR = 60 * 60 * 1000;
+    return now >= start.getTime() - 14 * HOUR && now <= end.getTime() + 12 * HOUR;
+}
+
+function tierFromEventId(eventID) {
+    if (/-mega-raids-/.test(eventID)) return 'Mega Raids';
+    const starMatch = eventID.match(/(\d)-star-raid-battles/);
+    if (starMatch) return `${starMatch[1]}-Star Raids`;
+    return null;
+}
+
+// Individual event pages list their headline bosses in the same simple
+// `.pkmn-list-item` format used by pages/detailed/raidbattles.js, rather
+// than the rich stat cards on /raid-bosses/ - so name/image/shiny is all
+// that's available here.
+function fetchEventRaidBosses(eventID) {
+    return JSDOM.fromURL(`https://leekduck.com/events/${eventID}/`, {})
+        .then((dom) => {
+            const pageContent = dom.window.document.querySelector('.page-content');
+            const result = [];
+            let lastHeader = "";
+
+            if (pageContent) {
+                pageContent.childNodes.forEach(n => {
+                    if (n.className && n.className.includes && n.className.includes("event-section-header")) {
+                        lastHeader = n.id;
+                    }
+
+                    if (lastHeader === "raids" && n.className === "pkmn-list-flex") {
+                        n.querySelectorAll(':scope > .pkmn-list-item').forEach(item => {
+                            const name = item.querySelector(':scope > .pkmn-name')?.textContent.trim();
+                            if (!name) return;
+                            result.push({
+                                name,
+                                image: item.querySelector(':scope > .pkmn-list-img > img')?.src || "",
+                                canBeShiny: item.querySelector(':scope > .shiny-icon') != null
+                            });
+                        });
+                    }
+                });
+            }
+
+            return result;
+        })
+        .catch(() => []);
+}
+
+// The /raid-bosses/ page only ever renders the raid rotation for whichever
+// region/timezone the request is treated as coming from. Cross-reference
+// the public events feed for any other regular/mega raid-battle event that
+// is currently ongoing somewhere else in the world and merge in its bosses
+// if they weren't already picked up from the page itself. Shadow raids are
+// left alone since a single event page there only ever lists one headline
+// boss, not the full multi-tier shadow roster.
+function addBossesOngoingElsewhere(bosses) {
+    return fetchJson(EVENTS_FEED_URL).then(feed => {
+        const now = Date.now();
+        const existingNames = new Set(bosses.map(b => b.name.toLowerCase()));
+
+        const candidates = (feed || []).filter(e =>
+            e && e.eventID &&
+            (/-raid-battles-/.test(e.eventID) || /-mega-raids-/.test(e.eventID)) &&
+            !/-shadow-raids-/.test(e.eventID) &&
+            isOngoingSomewhereInWorld(e.start, e.end, now)
+        );
+
+        return Promise.all(candidates.map(e =>
+            fetchEventRaidBosses(e.eventID).then(eventBosses => ({ event: e, eventBosses }))
+        )).then(results => {
+            results.forEach(({ event, eventBosses }) => {
+                const tier = tierFromEventId(event.eventID) || '5-Star Raids';
+                eventBosses.forEach(b => {
+                    const key = b.name.toLowerCase();
+                    if (existingNames.has(key)) return;
+                    existingNames.add(key);
+                    bosses.push({
+                        name: b.name,
+                        tier,
+                        canBeShiny: b.canBeShiny,
+                        types: [],
+                        combatPower: {
+                            normal: { min: -1, max: -1 },
+                            boosted: { min: -1, max: -1 }
+                        },
+                        boostedWeather: [],
+                        image: b.image
+                    });
+                });
+            });
+
+            return bosses;
+        });
+    }).catch(_err => {
+        console.log(_err);
+        return bosses;
+    });
+}
+
+function writeBosses(bosses) {
+    fs.writeFile('files/raids.json', JSON.stringify(bosses, null, 4), err => {
+        if (err) {
+            console.error(err);
+            return;
+        }
+    });
+    fs.writeFile('files/raids.min.json', JSON.stringify(bosses), err => {
+        if (err) {
+            console.error(err);
+            return;
+        }
+    });
+}
+
 function get() {
     return new Promise(resolve => {
         JSDOM.fromURL("https://leekduck.com/raid-bosses/", {
@@ -92,17 +238,8 @@ function get() {
                         });
                     });
 
-                    fs.writeFile('files/raids.json', JSON.stringify(bosses, null, 4), err => {
-                        if (err) {
-                            console.error(err);
-                            return;
-                        }
-                    });
-                    fs.writeFile('files/raids.min.json', JSON.stringify(bosses), err => {
-                        if (err) {
-                            console.error(err);
-                            return;
-                        }
+                addBossesOngoingElsewhere(bosses).then(finalBosses => {
+                    writeBosses(finalBosses);
                 });
             }).catch(_err => {
                 console.log(_err);
