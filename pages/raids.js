@@ -83,29 +83,43 @@ function fetchEventRaidBosses(eventID) {
         .catch(() => []);
 }
 
+// Shadow raid bosses are named "Shadow X" on /raid-bosses/, but their
+// underlying event page (which only ever covers the headline 5-star boss,
+// not the full multi-tier shadow roster) lists them without that prefix.
+function normalizeBossKey(name) {
+    return name.replace(/^Shadow\s+/i, '').trim().toLowerCase();
+}
+
 // The /raid-bosses/ page only ever renders the raid rotation for whichever
 // region/timezone the request is treated as coming from. Cross-reference
-// the public events feed for any other regular/mega raid-battle event that
-// is currently ongoing somewhere else in the world and merge in its bosses
-// if they weren't already picked up from the page itself. Shadow raids are
-// left alone since a single event page there only ever lists one headline
-// boss, not the full multi-tier shadow roster.
+// the public events feed for every regular/mega/shadow raid-battle event
+// that is currently ongoing somewhere else in the world:
+//  - use each event's start/end to attach a "when is this actually live"
+//    window to every boss, including ones already picked up from the page
+//  - merge in bosses from non-shadow events that the page itself missed
+//    (shadow events are only used for timing here, since a single shadow
+//    event page never lists the full roster, just its headline boss)
 function addBossesOngoingElsewhere(bosses) {
     return fetchJson(EVENTS_FEED_URL).then(feed => {
         const now = Date.now();
-        const existingNames = new Set(bosses.map(b => b.name.toLowerCase()));
 
-        const candidates = (feed || []).filter(e =>
+        const ongoingRaidEvents = (feed || []).filter(e =>
             e && e.eventID &&
-            (/-raid-battles-/.test(e.eventID) || /-mega-raids-/.test(e.eventID)) &&
-            !/-shadow-raids-/.test(e.eventID) &&
+            (/-raid-battles-/.test(e.eventID) || /-mega-raids-/.test(e.eventID) || /-shadow-raids-/.test(e.eventID)) &&
             isOngoingSomewhereInWorld(e.start, e.end, now)
         );
 
-        return Promise.all(candidates.map(e =>
+        return Promise.all(ongoingRaidEvents.map(e =>
             fetchEventRaidBosses(e.eventID).then(eventBosses => ({ event: e, eventBosses }))
         )).then(results => {
+            const timingByBossKey = new Map();
             results.forEach(({ event, eventBosses }) => {
+                eventBosses.forEach(b => timingByBossKey.set(normalizeBossKey(b.name), { start: event.start, end: event.end }));
+            });
+
+            const existingNames = new Set(bosses.map(b => b.name.toLowerCase()));
+            results.forEach(({ event, eventBosses }) => {
+                if (/-shadow-raids-/.test(event.eventID)) return;
                 const tier = tierFromEventId(event.eventID) || '5-Star Raids';
                 eventBosses.forEach(b => {
                     const key = b.name.toLowerCase();
@@ -121,15 +135,30 @@ function addBossesOngoingElsewhere(bosses) {
                             boosted: { min: -1, max: -1 }
                         },
                         boostedWeather: [],
-                        image: b.image
+                        image: b.image,
+                        start: event.start,
+                        end: event.end
                     });
                 });
+            });
+
+            bosses.forEach(b => {
+                if (b.start !== undefined) return;
+                const timing = timingByBossKey.get(normalizeBossKey(b.name));
+                b.start = timing?.start || null;
+                b.end = timing?.end || null;
             });
 
             return bosses;
         });
     }).catch(_err => {
         console.log(_err);
+        bosses.forEach(b => {
+            if (b.start === undefined) {
+                b.start = null;
+                b.end = null;
+            }
+        });
         return bosses;
     });
 }
