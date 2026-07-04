@@ -20,7 +20,8 @@ function get(url, id, bkp)
 
             var generic = {
                 hasSpawns: false,
-                hasFieldResearchTasks: false
+                hasFieldResearchTasks: false,
+                bonuses: []
             };
             // For events with specific spawns, there is a h2 heading element with id 'spawns'
             if (dom.window.document.getElementById('spawns') !== null)
@@ -28,6 +29,15 @@ function get(url, id, bkp)
             // For events with specific field research tasks, there is a h2 heading element with id 'field-research-tasks'
             if (dom.window.document.getElementById('field-research-tasks') !== null)
                 generic.hasFieldResearchTasks = true;
+
+            // For events with event bonuses, there is a list of '.bonus-item' elements
+            dom.window.document.querySelectorAll('.bonus-item').forEach(b => {
+                var bonus = {
+                    text: b.querySelector(':scope > .bonus-text').innerHTML,
+                    image: b.querySelector(':scope > .item-circle > img').src
+                };
+                generic.bonuses.push(bonus);
+            });
 
             fs.writeFile(`files/temp/${id}_generic.json`, JSON.stringify({ id: id, type: "generic", data: generic }), err => {
                 if (err) {
