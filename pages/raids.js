@@ -40,6 +40,26 @@ function isOngoingSomewhereInWorld(startStr, endStr, now) {
     return now >= start.getTime() - 14 * HOUR && now <= end.getTime() + 12 * HOUR;
 }
 
+// The exact complement of the upper bound above, so an event can never be
+// both "ongoing somewhere" and "ended" at the same instant. Bounded to a
+// recent window because only the rotation the page might still be showing
+// is worth spending a fetch on - an event from months ago cannot be the
+// cause of a stale card.
+const ENDED_LOOKBACK_DAYS = 14;
+
+function hasEndedEverywhere(endStr, now) {
+    const end = parseAsUtc(endStr);
+    if (!end || isNaN(end)) return false;
+    const HOUR = 60 * 60 * 1000;
+    const overEverywhere = end.getTime() + 12 * HOUR;
+    return now > overEverywhere && now <= overEverywhere + ENDED_LOOKBACK_DAYS * 24 * HOUR;
+}
+
+function isRaidBattleEvent(e) {
+    return !!(e && e.eventID) &&
+        (/-raid-battles-/.test(e.eventID) || /-mega-raids-/.test(e.eventID) || /-shadow-raids-/.test(e.eventID));
+}
+
 function tierFromEventId(eventID) {
     if (/-mega-raids-/.test(eventID)) return 'Mega Raids';
     const starMatch = eventID.match(/(\d)-star-raid-battles/);
@@ -99,22 +119,30 @@ function normalizeBossKey(name) {
 //  - merge in bosses from non-shadow events that the page itself missed
 //    (shadow events are only used for timing here, since a single shadow
 //    event page never lists the full roster, just its headline boss)
-function addBossesOngoingElsewhere(bosses) {
+//  - drop bosses whose raid event has already ended everywhere, which the
+//    page keeps rendering for hours after a rotation flips
+function reconcileBossesWithEvents(bosses) {
     return fetchJson(EVENTS_FEED_URL).then(feed => {
         const now = Date.now();
+        const raidEvents = (feed || []).filter(isRaidBattleEvent);
 
-        const ongoingRaidEvents = (feed || []).filter(e =>
-            e && e.eventID &&
-            (/-raid-battles-/.test(e.eventID) || /-mega-raids-/.test(e.eventID) || /-shadow-raids-/.test(e.eventID)) &&
-            isOngoingSomewhereInWorld(e.start, e.end, now)
-        );
+        const ongoingRaidEvents = raidEvents.filter(e => isOngoingSomewhereInWorld(e.start, e.end, now));
+        const endedRaidEvents = raidEvents.filter(e => hasEndedEverywhere(e.end, now));
 
-        return Promise.all(ongoingRaidEvents.map(e =>
-            fetchEventRaidBosses(e.eventID).then(eventBosses => ({ event: e, eventBosses }))
-        )).then(results => {
+        return Promise.all([
+            Promise.all(ongoingRaidEvents.map(e =>
+                fetchEventRaidBosses(e.eventID).then(eventBosses => ({ event: e, eventBosses }))
+            )),
+            Promise.all(endedRaidEvents.map(e => fetchEventRaidBosses(e.eventID)))
+        ]).then(([results, endedBossLists]) => {
             const timingByBossKey = new Map();
             results.forEach(({ event, eventBosses }) => {
                 eventBosses.forEach(b => timingByBossKey.set(normalizeBossKey(b.name), { start: event.start, end: event.end }));
+            });
+
+            const endedBossKeys = new Set();
+            endedBossLists.forEach(eventBosses => {
+                eventBosses.forEach(b => endedBossKeys.add(normalizeBossKey(b.name)));
             });
 
             const existingNames = new Set(bosses.map(b => b.name.toLowerCase()));
@@ -149,7 +177,17 @@ function addBossesOngoingElsewhere(bosses) {
                 b.end = timing?.end || null;
             });
 
-            return bosses;
+            // Only drop a boss on positive evidence that its run is over: it
+            // was headlining an event that has ended, and no still-running
+            // event features it. Bosses no event mentions at all - the 1/3-star
+            // filler rotations, the wider shadow roster - are always kept,
+            // since silence in the feed says nothing about them. Requiring the
+            // second condition also keeps e.g. an ongoing Shadow Palkia when a
+            // separate regular Palkia event ends, as both share a boss key.
+            return bosses.filter(b => {
+                const key = normalizeBossKey(b.name);
+                return !endedBossKeys.has(key) || timingByBossKey.has(key);
+            });
         });
     }).catch(_err => {
         console.log(_err);
@@ -267,7 +305,7 @@ function get() {
                         });
                     });
 
-                addBossesOngoingElsewhere(bosses).then(finalBosses => {
+                reconcileBossesWithEvents(bosses).then(finalBosses => {
                     writeBosses(finalBosses);
                 });
             }).catch(_err => {
