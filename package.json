@@ -6,7 +6,8 @@
   "scripts": {
     "scrape": "node ./scrape.js",
     "detailedscrape": "node ./detailedscrape.js",
-    "combinedetails": "node ./combinedetails.js"
+    "combinedetails": "node ./combinedetails.js",
+    "test:research": "node ./test/research.test.js"
   },
   "author": "bigfoott",
   "license": "MIT",

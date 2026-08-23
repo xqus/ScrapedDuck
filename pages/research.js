@@ -3,6 +3,76 @@ const jsd = require('jsdom');
 const { JSDOM } = jsd;
 const https = require('https');
 
+/**
+ * Splits a reward label into its item name and quantity.
+ *
+ * LeekDuck writes quantities into the reward label rather than a dedicated
+ * element, and does it several different ways ("1000 Stardust",
+ * "Ultra Ball x20", "\u00d73 Rare Candy"). Anything that doesn't carry a
+ * quantity keeps the whole label as the name and reports a null amount.
+ */
+function splitRewardAmount(label)
+{
+    var text = label.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+
+    var trailing = text.match(/^(.+?)\s*[x\u00d7]\s*([\d.,]+)$/i);
+    if (trailing != null)
+    {
+        var trailingAmount = toAmount(trailing[2]);
+        if (trailingAmount != null)
+            return { name: trailing[1].trim(), amount: trailingAmount };
+    }
+
+    var leadingMultiplier = text.match(/^[x\u00d7]\s*([\d.,]+)\s+(.+)$/i);
+    if (leadingMultiplier != null)
+    {
+        var leadingMultiplierAmount = toAmount(leadingMultiplier[1]);
+        if (leadingMultiplierAmount != null)
+            return { name: leadingMultiplier[2].trim(), amount: leadingMultiplierAmount };
+    }
+
+    var leadingNumber = text.match(/^([\d.,]+)\s+(.+)$/);
+    if (leadingNumber != null)
+    {
+        var leadingNumberAmount = toAmount(leadingNumber[1]);
+        if (leadingNumberAmount != null)
+            return { name: leadingNumber[2].trim(), amount: leadingNumberAmount };
+    }
+
+    return { name: text, amount: null };
+}
+
+function toAmount(raw)
+{
+    var value = parseInt(raw.replace(/[.,\s]/g, ""), 10);
+    return isNaN(value) ? null : value;
+}
+
+/**
+ * Builds an item reward from a `.reward` node that isn't a Pokemon encounter
+ * (stardust, candy, TMs, berries, mega energy, ...). Returns null when the node
+ * carries no usable label.
+ */
+function parseItemReward(r)
+{
+    var labelNode = r.querySelector(":scope > .reward-label > span") || r.querySelector(":scope > .reward-label");
+    if (labelNode == null)
+        return null;
+
+    var label = labelNode.textContent.trim();
+    if (label == "")
+        return null;
+
+    var imageNode = r.querySelector(":scope > .reward-bubble > .reward-image") || r.querySelector(".reward-image");
+    var split = splitRewardAmount(label);
+
+    return {
+        name: split.name,
+        image: imageNode != null ? imageNode.src : "",
+        amount: split.amount
+    };
+}
+
 function get()
 {
     return new Promise(resolve => {
@@ -34,7 +104,8 @@ function get()
                     var type = taskNameToID[_e.querySelector(":scope > h2").innerHTML.trim()];
 
                     var rewards = [];
-                    
+                    var items = [];
+
                     task.querySelectorAll(":scope > .reward-list > .reward").forEach(r => {
                         if (r.dataset.rewardType == "encounter")
                         {
@@ -57,20 +128,43 @@ function get()
 
                             rewards.push(reward);
                         }
+                        else
+                        {
+                            var item = parseItemReward(r);
+
+                            if (item != null)
+                                items.push(item);
+                        }
                     });
 
-                    if (rewards.length > 0)
+                    if (rewards.length > 0 || items.length > 0)
                     {
-                        if (research.filter(r => r.text == text && r.type == type).length > 0)
+                        var foundResearch = research.findIndex(fr => { return fr.text == text && fr.type == type });
+
+                        if (foundResearch > -1)
                         {
-                            var foundResearch = research.findIndex(fr => { return fr.text == text });
                             rewards.forEach(rw => {
                                 research[foundResearch].rewards.push(rw);
                             });
+
+                            if (items.length > 0)
+                            {
+                                if (research[foundResearch].items == undefined)
+                                    research[foundResearch].items = [];
+
+                                items.forEach(it => {
+                                    research[foundResearch].items.push(it);
+                                });
+                            }
                         }
                         else
                         {
-                            research.push({ "text": text, "type": type, "rewards": rewards});
+                            var entry = { "text": text, "type": type, "rewards": rewards };
+
+                            if (items.length > 0)
+                                entry.items = items;
+
+                            research.push(entry);
                         }
                     }
                 });
@@ -127,4 +221,4 @@ function get()
     })
 }
 
-module.exports = { get }
+module.exports = { get, parseItemReward, splitRewardAmount }
